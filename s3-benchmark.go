@@ -5,18 +5,10 @@ package main
 
 import (
 	"bytes"
-	"crypto/md5"
+	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"flag"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"code.cloudfoundry.org/bytefmt"
-	"context"
 	"io"
 	"io/ioutil"
 	"log"
@@ -24,20 +16,32 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sync"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"code.cloudfoundry.org/bytefmt"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // Global variables
 var access_key, secret_key, url_host, bucket, region string
 var duration_secs, threads, loops int
 var object_size uint64
-var object_data []byte
-var object_data_md5 string
 var running_threads, upload_count, download_count, delete_count, upload_slowdown_count, download_slowdown_count, delete_slowdown_count int32
 var endtime, upload_finish, download_finish, delete_finish time.Time
+var enable_cloudwatch bool
+var cloudwatch_namespace string
+var hostname string
+var s3_client *s3.Client
+var cloudwatch_client *cloudwatch.Client
 
 func logit(msg string) {
 	fmt.Println(msg)
@@ -95,12 +99,163 @@ func getS3Client() *s3.Client {
 	return client
 }
 
+func getCloudWatchClient() *cloudwatch.Client {
+	// Build our config
+	creds := credentials.NewStaticCredentialsProvider(access_key, secret_key, "")
+	
+	// Build the rest of the configuration
+	awsConfig, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithCredentialsProvider(creds),
+		config.WithRegion(region),
+	)
+	if err != nil {
+		log.Fatalf("FATAL: Unable to load AWS config for CloudWatch: %v", err)
+	}
+	
+	// Create CloudWatch client
+	client := cloudwatch.NewFromConfig(awsConfig)
+	
+	if client == nil {
+		log.Fatalf("FATAL: Unable to create CloudWatch client.")
+	}
+	
+	return client
+}
+
+func publishIndividualMetric(client *cloudwatch.Client, metricName string, value float64, unit cwtypes.StandardUnit) {
+	timestamp := time.Now()
+	
+	metricData := []cwtypes.MetricDatum{
+		{
+			MetricName: aws.String(metricName),
+			Value:      aws.Float64(value),
+			Unit:       unit,
+			Timestamp:  aws.Time(timestamp),
+			Dimensions: []cwtypes.Dimension{
+				{Name: aws.String("Bucket"), Value: aws.String(bucket)},
+				{Name: aws.String("Host"), Value: aws.String(hostname)},
+				{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
+			},
+		},
+	}
+	
+	// Publish metric to CloudWatch (fire and forget, don't block on errors)
+	go func() {
+		_, err := client.PutMetricData(context.TODO(), &cloudwatch.PutMetricDataInput{
+			Namespace:  aws.String(cloudwatch_namespace),
+			MetricData: metricData,
+		})
+		if err != nil {
+			log.Printf("WARNING: Failed to publish individual metric %s: %v", metricName, err)
+		}
+	}()
+}
+
+func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerSec, getOpsPerSec float64, putCount, getCount int32) {
+	if !enable_cloudwatch || cloudwatch_client == nil {
+		return
+	}
+	
+	timestamp := time.Now()
+	
+	// Create metric data
+	var metricData []cwtypes.MetricDatum
+	
+	// PUT throughput metric (MB/s)
+	metricData = append(metricData, cwtypes.MetricDatum{
+		MetricName: aws.String("PutThroughput"),
+		Value:      aws.Float64(putThroughput / 1024 / 1024), // Convert to MB/s
+		Unit:       cwtypes.StandardUnitMegabytesSecond,
+		Timestamp:  aws.Time(timestamp),
+		Dimensions: []cwtypes.Dimension{
+			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
+			{Name: aws.String("Host"), Value: aws.String(hostname)},
+			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
+		},
+	})
+	
+	// GET throughput metric (MB/s)
+	metricData = append(metricData, cwtypes.MetricDatum{
+		MetricName: aws.String("GetThroughput"),
+		Value:      aws.Float64(getThroughput / 1024 / 1024), // Convert to MB/s
+		Unit:       cwtypes.StandardUnitMegabytesSecond,
+		Timestamp:  aws.Time(timestamp),
+		Dimensions: []cwtypes.Dimension{
+			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
+			{Name: aws.String("Host"), Value: aws.String(hostname)},
+			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
+		},
+	})
+	
+	// PUT operations per second
+	metricData = append(metricData, cwtypes.MetricDatum{
+		MetricName: aws.String("PutOpsPerSecond"),
+		Value:      aws.Float64(putOpsPerSec),
+		Unit:       cwtypes.StandardUnitCountSecond,
+		Timestamp:  aws.Time(timestamp),
+		Dimensions: []cwtypes.Dimension{
+			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
+			{Name: aws.String("Host"), Value: aws.String(hostname)},
+			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
+		},
+	})
+	
+	// GET operations per second
+	metricData = append(metricData, cwtypes.MetricDatum{
+		MetricName: aws.String("GetOpsPerSecond"),
+		Value:      aws.Float64(getOpsPerSec),
+		Unit:       cwtypes.StandardUnitCountSecond,
+		Timestamp:  aws.Time(timestamp),
+		Dimensions: []cwtypes.Dimension{
+			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
+			{Name: aws.String("Host"), Value: aws.String(hostname)},
+			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
+		},
+	})
+	
+	// PUT object count
+	metricData = append(metricData, cwtypes.MetricDatum{
+		MetricName: aws.String("PutObjectCount"),
+		Value:      aws.Float64(float64(putCount)),
+		Unit:       cwtypes.StandardUnitCount,
+		Timestamp:  aws.Time(timestamp),
+		Dimensions: []cwtypes.Dimension{
+			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
+			{Name: aws.String("Host"), Value: aws.String(hostname)},
+			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
+		},
+	})
+	
+	// GET object count
+	metricData = append(metricData, cwtypes.MetricDatum{
+		MetricName: aws.String("GetObjectCount"),
+		Value:      aws.Float64(float64(getCount)),
+		Unit:       cwtypes.StandardUnitCount,
+		Timestamp:  aws.Time(timestamp),
+		Dimensions: []cwtypes.Dimension{
+			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
+			{Name: aws.String("Host"), Value: aws.String(hostname)},
+			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
+		},
+	})
+	
+	// Publish metrics to CloudWatch
+	_, err := cloudwatch_client.PutMetricData(context.TODO(), &cloudwatch.PutMetricDataInput{
+		Namespace:  aws.String(cloudwatch_namespace),
+		MetricData: metricData,
+	})
+	
+	if err != nil {
+		log.Printf("WARNING: Failed to publish CloudWatch metrics: %v", err)
+	} else {
+		log.Printf("Successfully published aggregate metrics to CloudWatch namespace: %s", cloudwatch_namespace)
+	}
+}
+
 func createBucket(ignore_errors bool) {
-	// Get a client
-	client := getS3Client()
 	// Create our bucket (may already exist without error)
 	in := &s3.CreateBucketInput{Bucket: aws.String(bucket)}
-	if _, err := client.CreateBucket(context.TODO(), in); err != nil {
+	if _, err := s3_client.CreateBucket(context.TODO(), in); err != nil {
 		if ignore_errors {
 			log.Printf("WARNING: createBucket %s error, ignoring %v", bucket, err)
 		} else {
@@ -110,8 +265,6 @@ func createBucket(ignore_errors bool) {
 }
 
 func deleteAllObjects() {
-	// Get a client
-	client := getS3Client()
 	// Use multiple routines to do the actual delete
 	var doneDeletes sync.WaitGroup
 	// Loop deleting our versions reading as big a list as we can
@@ -120,7 +273,7 @@ func deleteAllObjects() {
 	for loop := 1; ; loop++ {
 		// Delete all the existing objects and versions in the bucket
 		in := &s3.ListObjectVersionsInput{Bucket: aws.String(bucket), KeyMarker: keyMarker, VersionIdMarker: versionId, MaxKeys: aws.Int32(1000)}
-		if listVersions, listErr := client.ListObjectVersions(context.TODO(), in); listErr == nil {
+		if listVersions, listErr := s3_client.ListObjectVersions(context.TODO(), in); listErr == nil {
 			delete := &s3.DeleteObjectsInput{Bucket: aws.String(bucket), Delete: &types.Delete{Quiet: aws.Bool(true)}}
 			for _, version := range listVersions.Versions {
 				delete.Delete.Objects = append(delete.Delete.Objects, types.ObjectIdentifier{Key: version.Key, VersionId: version.VersionId})
@@ -131,7 +284,7 @@ func deleteAllObjects() {
 			if len(delete.Delete.Objects) > 0 {
 				// Start a delete routine
 				doDelete := func(deleteInput *s3.DeleteObjectsInput) {
-					if _, e := client.DeleteObjects(context.TODO(), deleteInput); e != nil {
+					if _, e := s3_client.DeleteObjects(context.TODO(), deleteInput); e != nil {
 						err = fmt.Errorf("DeleteObjects unexpected failure: %s", e.Error())
 					}
 					doneDeletes.Done()
@@ -164,16 +317,24 @@ func deleteAllObjects() {
 
 
 func runUpload(thread_num int) {
-	client := getS3Client()
 	for time.Now().Before(endtime) {
 		objnum := atomic.AddInt32(&upload_count, 1)
 		key := fmt.Sprintf("Object-%d", objnum)
 		
-		_, err := client.PutObject(context.TODO(), &s3.PutObjectInput{
+		// Generate unique random data for each object
+		unique_data := make([]byte, object_size)
+		rand.Read(unique_data)
+		
+		// Track operation time
+		opStart := time.Now()
+		
+		_, err := s3_client.PutObject(context.TODO(), &s3.PutObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(key),
-			Body:   bytes.NewReader(object_data),
+			Body:   bytes.NewReader(unique_data),
 		})
+		
+		opDuration := time.Since(opStart).Seconds()
 		
 		if err != nil {
 			if strings.Contains(err.Error(), "ServiceUnavailable") {
@@ -182,6 +343,11 @@ func runUpload(thread_num int) {
 			} else {
 				log.Fatalf("FATAL: Error uploading object %s: %v", key, err)
 			}
+		} else if enable_cloudwatch && cloudwatch_client != nil {
+			// Publish individual upload metrics
+			throughput := float64(object_size) / opDuration / 1024 / 1024 // MB/s
+// 			publishIndividualMetric(cloudwatch_client, "PutLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds) // Convert to ms
+			publishIndividualMetric(cloudwatch_client, "PutThroughputIndividual", throughput, cwtypes.StandardUnitMegabytesSecond)
 		}
 	}
 	// Remember last done time
@@ -191,13 +357,15 @@ func runUpload(thread_num int) {
 }
 
 func runDownload(thread_num int) {
-	client := getS3Client()
 	for time.Now().Before(endtime) {
 		atomic.AddInt32(&download_count, 1)
 		objnum := rand.Int31n(upload_count) + 1
 		key := fmt.Sprintf("Object-%d", objnum)
 		
-		result, err := client.GetObject(context.TODO(), &s3.GetObjectInput{
+		// Track operation time
+		opStart := time.Now()
+		
+		result, err := s3_client.GetObject(context.TODO(), &s3.GetObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(key),
 		})
@@ -212,6 +380,15 @@ func runDownload(thread_num int) {
 		} else if result.Body != nil {
 			io.Copy(ioutil.Discard, result.Body)
 			result.Body.Close()
+			
+			opDuration := time.Since(opStart).Seconds()
+			
+			if enable_cloudwatch && cloudwatch_client != nil {
+				// Publish individual download metrics
+				throughput := float64(object_size) / opDuration / 1024 / 1024 // MB/s
+// 				publishIndividualMetric(cloudwatch_client, "GetLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds) // Convert to ms
+				publishIndividualMetric(cloudwatch_client, "GetThroughputIndividual", throughput, cwtypes.StandardUnitMegabytesSecond)
+			}
 		}
 	}
 	// Remember last done time
@@ -221,7 +398,6 @@ func runDownload(thread_num int) {
 }
 
 func runDelete(thread_num int) {
-	client := getS3Client()
 	for {
 		objnum := atomic.AddInt32(&delete_count, 1)
 		if objnum > upload_count {
@@ -229,7 +405,7 @@ func runDelete(thread_num int) {
 		}
 		key := fmt.Sprintf("Object-%d", objnum)
 		
-		_, err := client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+		_, err := s3_client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(key),
 		})
@@ -257,14 +433,16 @@ func main() {
 	myflag := flag.NewFlagSet("myflag", flag.ExitOnError)
 	myflag.StringVar(&access_key, "a", "", "Access key")
 	myflag.StringVar(&secret_key, "s", "", "Secret key")
-	myflag.StringVar(&url_host, "u", "https://s3.us-east-005.backblazeb2.com", "URL for host with method prefix")
-	myflag.StringVar(&bucket, "b", "backblaze-benchmark-bucket", "Bucket for testing")
-	myflag.StringVar(&region, "r", "us-east-005", "Region for testing")
+	myflag.StringVar(&url_host, "u", "https://s3.us-east-1.amazonaws.com", "URL for host with method prefix")
+	myflag.StringVar(&bucket, "b", "s3-benchmark-bucket", "Bucket for testing")
+	myflag.StringVar(&region, "r", "us-east-1", "Region for testing")
 	myflag.IntVar(&duration_secs, "d", 60, "Duration of each test in seconds")
 	myflag.IntVar(&threads, "t", 1, "Number of threads to run")
 	myflag.IntVar(&loops, "l", 1, "Number of times to repeat test")
 	var sizeArg string
 	myflag.StringVar(&sizeArg, "z", "1M", "Size of objects in bytes with postfix K, M, and G")
+	myflag.BoolVar(&enable_cloudwatch, "cw", false, "Enable CloudWatch metrics publishing")
+	myflag.StringVar(&cloudwatch_namespace, "cwns", "S3Benchmark", "CloudWatch namespace for metrics")
 	if err := myflag.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
 	}
@@ -281,16 +459,25 @@ func main() {
 		log.Fatalf("Invalid -z argument for object size: %v", err)
 	}
 
-	// Echo the parameters
-	logit(fmt.Sprintf("Parameters: url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s",
-		url_host, bucket, region, duration_secs, threads, loops, sizeArg))
+	// Get hostname for CloudWatch dimensions
+	hostname, err = os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
 
-	// Initialize data for the bucket
-	object_data = make([]byte, object_size)
-	rand.Read(object_data)
-	hasher := md5.New()
-	hasher.Write(object_data)
-	object_data_md5 = base64.StdEncoding.EncodeToString(hasher.Sum(nil))
+	// Echo the parameters
+	logit(fmt.Sprintf("Parameters: url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s, cloudwatch=%v, namespace=%s, host=%s",
+		url_host, bucket, region, duration_secs, threads, loops, sizeArg, enable_cloudwatch, cloudwatch_namespace, hostname))
+
+	// Initialize S3 client (create once, reuse for all operations)
+	s3_client = getS3Client()
+	log.Printf("S3 client initialized for %s", url_host)
+
+	// Initialize CloudWatch client if enabled (create once, reuse for all operations)
+	if enable_cloudwatch {
+		cloudwatch_client = getCloudWatchClient()
+		log.Printf("CloudWatch metrics enabled - namespace: %s, host: %s", cloudwatch_namespace, hostname)
+	}
 
 	// Create the bucket and delete all the objects
 	createBucket(true)
@@ -339,9 +526,13 @@ func main() {
 		}
 		download_time := download_finish.Sub(starttime).Seconds()
 
-		bps = float64(uint64(download_count)*object_size) / download_time
+		bps_download := float64(uint64(download_count)*object_size) / download_time
 		logit(fmt.Sprintf("Loop %d: GET time %.1f secs, objects = %d, speed = %sB/sec, %.1f operations/sec. Slowdowns = %d",
-			loop, download_time, download_count, bytefmt.ByteSize(uint64(bps)), float64(download_count)/download_time, download_slowdown_count))
+			loop, download_time, download_count, bytefmt.ByteSize(uint64(bps_download)), float64(download_count)/download_time, download_slowdown_count))
+
+		// Publish metrics to CloudWatch
+		bps_upload := float64(uint64(upload_count)*object_size) / upload_time
+		publishCloudWatchMetrics(loop, bps_upload, bps_download, float64(upload_count)/upload_time, float64(download_count)/download_time, upload_count, download_count)
 
 		// Run the delete case
 		running_threads = int32(threads)
