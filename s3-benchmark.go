@@ -134,7 +134,6 @@ func publishIndividualMetric(client *cloudwatch.Client, metricName string, value
 			Timestamp:  aws.Time(timestamp),
 			Dimensions: []cwtypes.Dimension{
 				{Name: aws.String("Bucket"), Value: aws.String(bucket)},
-				{Name: aws.String("Host"), Value: aws.String(hostname)},
 			},
 		},
 	}
@@ -159,8 +158,6 @@ func createMetric(name string, value float64, unit cwtypes.StandardUnit, timesta
 		Timestamp:  aws.Time(timestamp),
 		Dimensions: []cwtypes.Dimension{
 			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
-			{Name: aws.String("Host"), Value: aws.String(hostname)},
-			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
 		},
 	}
 }
@@ -262,7 +259,7 @@ func deleteAllObjects() {
 func runUpload(thread_num int) {
 	for time.Now().Before(endtime) {
 		objnum := atomic.AddInt32(&upload_count, 1)
-		key := fmt.Sprintf("Object-%d", objnum)
+		key := fmt.Sprintf("Object-%d-%d", objnum, hostname)
 		
 		// Generate unique random data for each object
 		unique_data := make([]byte, object_size)
@@ -303,8 +300,10 @@ func runUpload(thread_num int) {
 func runDownload(thread_num int) {
 	for time.Now().Before(endtime) {
 		atomic.AddInt32(&download_count, 1)
-		objnum := rand.Int31n(upload_count) + 1
-		key := fmt.Sprintf("Object-%d", objnum)
+		// Use round-robin to avoid multiple threads downloading the same object
+		// This prevents race conditions and reduces S3 rate limiting
+		objnum := (download_count % upload_count) + 1
+		key := fmt.Sprintf("Object-%d-%d", objnum, hostname)
 		
 		// Track operation time
 		opStart := time.Now()
@@ -331,7 +330,7 @@ func runDownload(thread_num int) {
 				// Publish individual download metrics
 				throughput := float64(object_size) / opDuration// Convert to MB/s
 				// publishIndividualMetric(cloudwatch_client, "GetLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds)
-				publishIndividualMetric(cloudwatch_client, "GetThroughput", throughput, cwtypes.StandardUnitBytesSecond)
+				publishIndividualMetric(cloudwatch_client, "GetThroughputIndivo", throughput, cwtypes.StandardUnitBytesSecond)
 				publishIndividualMetric(cloudwatch_client, "GetBytes", float64(object_size), cwtypes.StandardUnitBytes)
 			}
 		}
@@ -348,7 +347,7 @@ func runDelete(thread_num int) {
 		if objnum > upload_count {
 			break
 		}
-		key := fmt.Sprintf("Object-%d", objnum)
+		key := fmt.Sprintf("Object-%d-%d", objnum, hostname)
 		
 		_, err := s3_client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 			Bucket: aws.String(bucket),
