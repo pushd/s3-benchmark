@@ -300,9 +300,7 @@ func runUpload(thread_num int) {
 func runDownload(thread_num int) {
 	for time.Now().Before(endtime) {
 		atomic.AddInt32(&download_count, 1)
-		// Use round-robin to avoid multiple threads downloading the same object
-		// This prevents race conditions and reduces S3 rate limiting
-		objnum := (download_count % upload_count) + 1
+		objnum := rand.Int31n(upload_count) + 1
 		key := fmt.Sprintf("Object-%d-%s", objnum, hostname)
 		
 		// Track operation time
