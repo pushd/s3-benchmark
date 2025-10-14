@@ -259,7 +259,7 @@ func deleteAllObjects() {
 func runUpload(thread_num int) {
 	for time.Now().Before(endtime) {
 		objnum := atomic.AddInt32(&upload_count, 1)
-		key := fmt.Sprintf("Object-%d-%d", objnum, hostname)
+		key := fmt.Sprintf("Object-%d-%s", objnum, hostname)
 		
 		// Generate unique random data for each object
 		unique_data := make([]byte, object_size)
@@ -303,7 +303,7 @@ func runDownload(thread_num int) {
 		// Use round-robin to avoid multiple threads downloading the same object
 		// This prevents race conditions and reduces S3 rate limiting
 		objnum := (download_count % upload_count) + 1
-		key := fmt.Sprintf("Object-%d-%d", objnum, hostname)
+		key := fmt.Sprintf("Object-%d-%s", objnum, hostname)
 		
 		// Track operation time
 		opStart := time.Now()
@@ -347,7 +347,7 @@ func runDelete(thread_num int) {
 		if objnum > upload_count {
 			break
 		}
-		key := fmt.Sprintf("Object-%d-%d", objnum, hostname)
+		key := fmt.Sprintf("Object-%d-%s", objnum, hostname)
 		
 		_, err := s3_client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 			Bucket: aws.String(bucket),
