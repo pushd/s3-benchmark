@@ -288,10 +288,10 @@ func runUpload(thread_num int) {
 			}
 		} else if enable_cloudwatch && cloudwatch_client != nil {
 			// Publish individual upload metrics
-                throughput := float64(object_size) / opDuration // MB/s
-// 			publishIndividualMetric(cloudwatch_client, "PutLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds) // Convert to ms
-			publishIndividualMetric(cloudwatch_client, "PutThroughputIndividual", throughput, cwtypes.StandardUnitMegabytesSecond)
-			publishIndividualMetric(cloudwatch_client, "BytesUploaded", float64(object_size), cwtypes.StandardUnitMegabytesSecond)
+			throughput := float64(object_size) / opDuration // Convert to MB/s
+			// publishIndividualMetric(cloudwatch_client, "PutLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds)
+			publishIndividualMetric(cloudwatch_client, "PutThroughput", throughput, cwtypes.StandardUnitBytesSecond)
+			publishIndividualMetric(cloudwatch_client, "PutBytes", float64(object_size), cwtypes.StandardUnitBytes)
 		}
 	}
 	// Remember last done time
@@ -329,10 +329,10 @@ func runDownload(thread_num int) {
 			
 			if enable_cloudwatch && cloudwatch_client != nil {
 				// Publish individual download metrics
-				throughput := float64(object_size) / opDuration  // MB/s
-// 				publishIndividualMetric(cloudwatch_client, "GetLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds) // Convert to ms
-				publishIndividualMetric(cloudwatch_client, "GetThroughputIndividual", throughput, cwtypes.StandardUnitMegabytesSecond)
-			    publishIndividualMetric(cloudwatch_client, "BytesDownloaded", float64(object_size), cwtypes.StandardUnitMegabytesSecond)
+				throughput := float64(object_size) / opDuration// Convert to MB/s
+				// publishIndividualMetric(cloudwatch_client, "GetLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds)
+				publishIndividualMetric(cloudwatch_client, "GetThroughput", throughput, cwtypes.StandardUnitBytesSecond)
+				publishIndividualMetric(cloudwatch_client, "GetBytes", float64(object_size), cwtypes.StandardUnitBytes)
 			}
 		}
 	}
