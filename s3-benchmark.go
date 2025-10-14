@@ -299,6 +299,12 @@ func runUpload(thread_num int) {
 
 func runDownload(thread_num int) {
 	for time.Now().Before(endtime) {
+		// Wait for some objects to be uploaded before starting downloads
+		if upload_count == 0 {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
 		atomic.AddInt32(&download_count, 1)
 		objnum := rand.Int31n(upload_count) + 1
 		key := fmt.Sprintf("Object-%d-%s", objnum, hostname)
@@ -315,6 +321,10 @@ func runDownload(thread_num int) {
 			if strings.Contains(err.Error(), "ServiceUnavailable") {
 				atomic.AddInt32(&download_slowdown_count, 1)
 				atomic.AddInt32(&download_count, -1)
+			} else if strings.Contains(err.Error(), "NoSuchKey") {
+				atomic.AddInt32(&download_slowdown_count, 1)
+				atomic.AddInt32(&download_count, -1)
+				log.Printf("Object %s not found (upload_count=%d), skipping...", key, upload_count)
 			} else {
 				log.Fatalf("FATAL: Error downloading object %s: %v", key, err)
 			}
