@@ -32,7 +32,8 @@ import (
 )
 
 // Global variables
-var access_key, secret_key, url_host, bucket, region string
+var s3_access_key, s3_secret_key, cw_access_key, cw_secret_key string
+var url_host, bucket, region string
 var duration_secs, threads, loops int
 var object_size uint64
 var running_threads, upload_count, download_count, delete_count, upload_slowdown_count, download_slowdown_count, delete_slowdown_count int32
@@ -74,7 +75,7 @@ var httpClient = &http.Client{Transport: HTTPTransport}
 
 func getS3Client() *s3.Client {
 	// Build our config
-	creds := credentials.NewStaticCredentialsProvider(access_key, secret_key, "")
+	creds := credentials.NewStaticCredentialsProvider(s3_access_key, s3_secret_key, "")
 	
 	// Build the rest of the configuration
 	awsConfig, err := config.LoadDefaultConfig(context.TODO(),
@@ -86,7 +87,7 @@ func getS3Client() *s3.Client {
 	}
 	
 	// Create S3 client with custom endpoint
-        client := s3.NewFromConfig(awsConfig, func(o *s3.Options) {
+	client := s3.NewFromConfig(awsConfig, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(url_host)
 		o.UsePathStyle = true
 		o.HTTPClient = &http.Client{Transport: HTTPTransport}
@@ -101,7 +102,7 @@ func getS3Client() *s3.Client {
 
 func getCloudWatchClient() *cloudwatch.Client {
 	// Build our config
-	creds := credentials.NewStaticCredentialsProvider(access_key, secret_key, "")
+	creds := credentials.NewStaticCredentialsProvider(cw_access_key, cw_secret_key, "")
 	
 	// Build the rest of the configuration
 	awsConfig, err := config.LoadDefaultConfig(context.TODO(),
@@ -134,7 +135,6 @@ func publishIndividualMetric(client *cloudwatch.Client, metricName string, value
 			Dimensions: []cwtypes.Dimension{
 				{Name: aws.String("Bucket"), Value: aws.String(bucket)},
 				{Name: aws.String("Host"), Value: aws.String(hostname)},
-				{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
 			},
 		},
 	}
@@ -151,93 +151,36 @@ func publishIndividualMetric(client *cloudwatch.Client, metricName string, value
 	}()
 }
 
+func createMetric(name string, value float64, unit cwtypes.StandardUnit, timestamp time.Time) cwtypes.MetricDatum {
+	return cwtypes.MetricDatum{
+		MetricName: aws.String(name),
+		Value:      aws.Float64(value),
+		Unit:       unit,
+		Timestamp:  aws.Time(timestamp),
+		Dimensions: []cwtypes.Dimension{
+			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
+			{Name: aws.String("Host"), Value: aws.String(hostname)},
+			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
+		},
+	}
+}
+
 func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerSec, getOpsPerSec float64, putCount, getCount int32) {
 	if !enable_cloudwatch || cloudwatch_client == nil {
 		return
 	}
 	
 	timestamp := time.Now()
-	
-	// Create metric data
-	var metricData []cwtypes.MetricDatum
-	
-	// PUT throughput metric (MB/s)
-	metricData = append(metricData, cwtypes.MetricDatum{
-		MetricName: aws.String("PutThroughput"),
-		Value:      aws.Float64(putThroughput / 1024 / 1024), // Convert to MB/s
-		Unit:       cwtypes.StandardUnitMegabytesSecond,
-		Timestamp:  aws.Time(timestamp),
-		Dimensions: []cwtypes.Dimension{
-			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
-			{Name: aws.String("Host"), Value: aws.String(hostname)},
-			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
-		},
-	})
-	
-	// GET throughput metric (MB/s)
-	metricData = append(metricData, cwtypes.MetricDatum{
-		MetricName: aws.String("GetThroughput"),
-		Value:      aws.Float64(getThroughput / 1024 / 1024), // Convert to MB/s
-		Unit:       cwtypes.StandardUnitMegabytesSecond,
-		Timestamp:  aws.Time(timestamp),
-		Dimensions: []cwtypes.Dimension{
-			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
-			{Name: aws.String("Host"), Value: aws.String(hostname)},
-			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
-		},
-	})
-	
-	// PUT operations per second
-	metricData = append(metricData, cwtypes.MetricDatum{
-		MetricName: aws.String("PutOpsPerSecond"),
-		Value:      aws.Float64(putOpsPerSec),
-		Unit:       cwtypes.StandardUnitCountSecond,
-		Timestamp:  aws.Time(timestamp),
-		Dimensions: []cwtypes.Dimension{
-			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
-			{Name: aws.String("Host"), Value: aws.String(hostname)},
-			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
-		},
-	})
-	
-	// GET operations per second
-	metricData = append(metricData, cwtypes.MetricDatum{
-		MetricName: aws.String("GetOpsPerSecond"),
-		Value:      aws.Float64(getOpsPerSec),
-		Unit:       cwtypes.StandardUnitCountSecond,
-		Timestamp:  aws.Time(timestamp),
-		Dimensions: []cwtypes.Dimension{
-			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
-			{Name: aws.String("Host"), Value: aws.String(hostname)},
-			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
-		},
-	})
-	
-	// PUT object count
-	metricData = append(metricData, cwtypes.MetricDatum{
-		MetricName: aws.String("PutObjectCount"),
-		Value:      aws.Float64(float64(putCount)),
-		Unit:       cwtypes.StandardUnitCount,
-		Timestamp:  aws.Time(timestamp),
-		Dimensions: []cwtypes.Dimension{
-			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
-			{Name: aws.String("Host"), Value: aws.String(hostname)},
-			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
-		},
-	})
-	
-	// GET object count
-	metricData = append(metricData, cwtypes.MetricDatum{
-		MetricName: aws.String("GetObjectCount"),
-		Value:      aws.Float64(float64(getCount)),
-		Unit:       cwtypes.StandardUnitCount,
-		Timestamp:  aws.Time(timestamp),
-		Dimensions: []cwtypes.Dimension{
-			{Name: aws.String("Bucket"), Value: aws.String(bucket)},
-			{Name: aws.String("Host"), Value: aws.String(hostname)},
-			{Name: aws.String("Threads"), Value: aws.String(fmt.Sprintf("%d", threads))},
-		},
-	})
+
+	// Create metric data using helper function
+	metricData := []cwtypes.MetricDatum{
+		createMetric("PutThroughput", putThroughput/1024/1024, cwtypes.StandardUnitMegabytesSecond, timestamp),
+		createMetric("GetThroughput", getThroughput/1024/1024, cwtypes.StandardUnitMegabytesSecond, timestamp),
+		createMetric("PutOpsPerSecond", putOpsPerSec, cwtypes.StandardUnitCountSecond, timestamp),
+		createMetric("GetOpsPerSecond", getOpsPerSec, cwtypes.StandardUnitCountSecond, timestamp),
+		createMetric("PutObjectCount", float64(putCount), cwtypes.StandardUnitCount, timestamp),
+		createMetric("GetObjectCount", float64(getCount), cwtypes.StandardUnitCount, timestamp),
+	}
 	
 	// Publish metrics to CloudWatch
 	_, err := cloudwatch_client.PutMetricData(context.TODO(), &cloudwatch.PutMetricDataInput{
@@ -345,9 +288,10 @@ func runUpload(thread_num int) {
 			}
 		} else if enable_cloudwatch && cloudwatch_client != nil {
 			// Publish individual upload metrics
-			throughput := float64(object_size) / opDuration / 1024 / 1024 // MB/s
+                throughput := float64(object_size) / opDuration // MB/s
 // 			publishIndividualMetric(cloudwatch_client, "PutLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds) // Convert to ms
 			publishIndividualMetric(cloudwatch_client, "PutThroughputIndividual", throughput, cwtypes.StandardUnitMegabytesSecond)
+			publishIndividualMetric(cloudwatch_client, "BytesUploaded", float64(object_size), cwtypes.StandardUnitMegabytesSecond)
 		}
 	}
 	// Remember last done time
@@ -385,9 +329,10 @@ func runDownload(thread_num int) {
 			
 			if enable_cloudwatch && cloudwatch_client != nil {
 				// Publish individual download metrics
-				throughput := float64(object_size) / opDuration / 1024 / 1024 // MB/s
+				throughput := float64(object_size) / opDuration  // MB/s
 // 				publishIndividualMetric(cloudwatch_client, "GetLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds) // Convert to ms
 				publishIndividualMetric(cloudwatch_client, "GetThroughputIndividual", throughput, cwtypes.StandardUnitMegabytesSecond)
+			    publishIndividualMetric(cloudwatch_client, "BytesDownloaded", float64(object_size), cwtypes.StandardUnitMegabytesSecond)
 			}
 		}
 	}
@@ -431,8 +376,10 @@ func main() {
 
 	// Parse command line
 	myflag := flag.NewFlagSet("myflag", flag.ExitOnError)
-	myflag.StringVar(&access_key, "a", "", "Access key")
-	myflag.StringVar(&secret_key, "s", "", "Secret key")
+	myflag.StringVar(&s3_access_key, "a", "", "S3 Access key (or set AWS_ACCESS_KEY_ID env var)")
+	myflag.StringVar(&s3_secret_key, "s", "", "S3 Secret key (or set AWS_SECRET_ACCESS_KEY env var)")
+	myflag.StringVar(&cw_access_key, "cwa", "", "CloudWatch Access key (defaults to S3 credentials or AWS_CW_ACCESS_KEY_ID env var)")
+	myflag.StringVar(&cw_secret_key, "cws", "", "CloudWatch Secret key (defaults to S3 credentials or AWS_CW_SECRET_ACCESS_KEY env var)")
 	myflag.StringVar(&url_host, "u", "https://s3.us-east-1.amazonaws.com", "URL for host with method prefix")
 	myflag.StringVar(&bucket, "b", "s3-benchmark-bucket", "Bucket for testing")
 	myflag.StringVar(&region, "r", "us-east-1", "Region for testing")
@@ -447,12 +394,40 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Check the arguments
-	if access_key == "" {
-		log.Fatal("Missing argument -a for access key.")
+	// Load credentials from environment variables if not provided via flags
+	if s3_access_key == "" {
+		s3_access_key = os.Getenv("AWS_ACCESS_KEY_ID")
 	}
-	if secret_key == "" {
-		log.Fatal("Missing argument -s for secret key.")
+	if s3_secret_key == "" {
+		s3_secret_key = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	}
+	
+	// CloudWatch credentials default to S3 credentials if not specified
+	if cw_access_key == "" {
+		cw_access_key = os.Getenv("AWS_CW_ACCESS_KEY_ID")
+		if cw_access_key == "" {
+			cw_access_key = s3_access_key // Use S3 credentials as fallback
+		}
+	}
+	if cw_secret_key == "" {
+		cw_secret_key = os.Getenv("AWS_CW_SECRET_ACCESS_KEY")
+		if cw_secret_key == "" {
+			cw_secret_key = s3_secret_key // Use S3 credentials as fallback
+		}
+	}
+
+	// Check the arguments
+	if s3_access_key == "" {
+		log.Fatal("Missing S3 access key. Provide via -a flag or AWS_ACCESS_KEY_ID environment variable.")
+	}
+	if s3_secret_key == "" {
+		log.Fatal("Missing S3 secret key. Provide via -s flag or AWS_SECRET_ACCESS_KEY environment variable.")
+	}
+	if enable_cloudwatch && cw_access_key == "" {
+		log.Fatal("Missing CloudWatch access key. Provide via -cwa flag or AWS_CW_ACCESS_KEY_ID environment variable.")
+	}
+	if enable_cloudwatch && cw_secret_key == "" {
+		log.Fatal("Missing CloudWatch secret key. Provide via -cws flag or AWS_CW_SECRET_ACCESS_KEY environment variable.")
 	}
 	var err error
 	if object_size, err = bytefmt.ToBytes(sizeArg); err != nil {
