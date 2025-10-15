@@ -41,6 +41,7 @@ var endtime, upload_finish, download_finish, delete_finish time.Time
 var enable_cloudwatch bool
 var cloudwatch_namespace string
 var hostname string
+var host_id string
 var s3_client *s3.Client
 var cloudwatch_client *cloudwatch.Client
 
@@ -259,7 +260,7 @@ func deleteAllObjects() {
 func runUpload(thread_num int) {
 	for time.Now().Before(endtime) {
 		objnum := atomic.AddInt32(&upload_count, 1)
-		key := fmt.Sprintf("Object-%d-%s", objnum, hostname)
+		key := fmt.Sprintf("Object-%d-%s", objnum, host_id)
 		
 		// Generate unique random data for each object
 		unique_data := make([]byte, object_size)
@@ -305,9 +306,16 @@ func runUpload(thread_num int) {
 func runDownload(thread_num int) {
 	for time.Now().Before(endtime) {
 
+		// Ensure upload_count is positive to avoid panic
+		currentCount := atomic.LoadInt32(&upload_count)
+		if currentCount == 0 {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		
 		atomic.AddInt32(&download_count, 1)
-		objnum := rand.Int31n(upload_count) + 1
-		key := fmt.Sprintf("Object-%d-%s", objnum, hostname)
+		objnum := rand.Int31n(currentCount) + 1
+		key := fmt.Sprintf("Object-%d-%s", objnum, host_id)
 		
 		// Track operation time
 		opStart := time.Now()
@@ -355,7 +363,7 @@ func runDelete(thread_num int) {
 		if objnum > upload_count {
 			break
 		}
-		key := fmt.Sprintf("Object-%d-%s", objnum, hostname)
+		key := fmt.Sprintf("Object-%d-%s", objnum, host_id)
 		
 		_, err := s3_client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 			Bucket: aws.String(bucket),
@@ -397,6 +405,7 @@ func main() {
 	myflag.StringVar(&sizeArg, "z", "1M", "Size of objects in bytes with postfix K, M, and G")
 	myflag.BoolVar(&enable_cloudwatch, "cw", false, "Enable CloudWatch metrics publishing")
 	myflag.StringVar(&cloudwatch_namespace, "cwns", "S3Benchmark", "CloudWatch namespace for metrics")
+	myflag.StringVar(&host_id, "hostid", "", "Host identifier for multi-host testing (default: auto-generated)")
 	if err := myflag.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
 	}
@@ -446,13 +455,16 @@ func main() {
 	if err != nil {
 		hostname = "unknown"
 	}
-	// Remove dashes and special characters from hostname
-	hostname = strings.ReplaceAll(hostname, "-", "")
-	hostname = strings.ReplaceAll(hostname, ".", "")
+	
+	// Set host_id for object naming (use provided value or generate one)
+	if host_id == "" {
+		// Auto-generate a simple numeric ID based on timestamp
+		host_id = fmt.Sprintf("h%d", time.Now().Unix()%10000)
+	}
 
 	// Echo the parameters
-	logit(fmt.Sprintf("Parameters: url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s, cloudwatch=%v, namespace=%s, host=%s",
-		url_host, bucket, region, duration_secs, threads, loops, sizeArg, enable_cloudwatch, cloudwatch_namespace, hostname))
+	logit(fmt.Sprintf("Parameters: url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s, cloudwatch=%v, namespace=%s, host=%s, hostid=%s",
+		url_host, bucket, region, duration_secs, threads, loops, sizeArg, enable_cloudwatch, cloudwatch_namespace, hostname, host_id))
 
 	// Initialize S3 client (create once, reuse for all operations)
 	s3_client = getS3Client()
