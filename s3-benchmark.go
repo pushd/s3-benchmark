@@ -257,10 +257,10 @@ func deleteAllObjects() {
 }
 
 
-func runUpload(thread_num int) {
+func runUpload(thread_num int, loopnum int) {
 	for time.Now().Before(endtime) {
 		objnum := atomic.AddInt32(&upload_count, 1)
-		key := fmt.Sprintf("Object-%d-%s", objnum, host_id)
+		key := fmt.Sprintf("Object-%d-%s-%s", objnum, host_id, loopnum)
 		
 		// Generate unique random data for each object
 		unique_data := make([]byte, object_size)
@@ -294,11 +294,6 @@ func runUpload(thread_num int) {
 			// Track successful uploads
 			atomic.AddInt32(&upload_success_count, 1)
 			
-			// Log every 10th successful upload for debugging
-			if upload_success_count%10 == 0 {
-				log.Printf("Successfully uploaded %s (success count: %d)", key, upload_success_count)
-			}
-			
 			if enable_cloudwatch && cloudwatch_client != nil {
 				// Publish individual upload metrics
 				throughput := float64(object_size) / opDuration // Convert to MB/s
@@ -314,7 +309,7 @@ func runUpload(thread_num int) {
 	atomic.AddInt32(&running_threads, -1)
 }
 
-func runDownload(thread_num int) {
+func runDownload(thread_num int, loopnum int) {
 	for time.Now().Before(endtime) {
 
 		// Wait for successful uploads before downloading
@@ -328,7 +323,7 @@ func runDownload(thread_num int) {
 		
 		atomic.AddInt32(&download_count, 1)
 		objnum := rand.Int31n(currentCount) + 1
-		key := fmt.Sprintf("Object-%d-%s", objnum, host_id)
+		key := fmt.Sprintf("Object-%d-%s-%s", objnum, host_id, loopnum)
 		
 		// Track operation time
 		opStart := time.Now()
@@ -345,7 +340,7 @@ func runDownload(thread_num int) {
 			} else if strings.Contains(err.Error(), "NoSuchKey") {
 				atomic.AddInt32(&download_slowdown_count, 1)
 				atomic.AddInt32(&download_count, -1)
-				log.Printf("Object %s not found (upload_count=%d), skipping...", key, upload_count)
+				log.Printf("Object %s not found (upload_count=%d, objnum=%d, host_id='%s'), skipping...", key, upload_count, objnum, host_id)
 			} else {
 				log.Fatalf("FATAL: Error downloading object %s: %v", key, err)
 			}
@@ -370,13 +365,13 @@ func runDownload(thread_num int) {
 	atomic.AddInt32(&running_threads, -1)
 }
 
-func runDelete(thread_num int) {
+func runDelete(thread_num int, loopnum int) {
 	for {
 		objnum := atomic.AddInt32(&delete_count, 1)
 		if objnum > upload_count {
 			break
 		}
-		key := fmt.Sprintf("Object-%d-%s", objnum, host_id)
+		key := fmt.Sprintf("Object-%d-%s-%s", objnum, host_id, loopnum)
 		
 		_, err := s3_client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 			Bucket: aws.String(bucket),
@@ -510,7 +505,7 @@ func main() {
 		starttime := time.Now()
 		endtime = starttime.Add(time.Second * time.Duration(duration_secs))
 		for n := 1; n <= threads; n++ {
-			go runUpload(n)
+			go runUpload(n, loop)
 		}
 
 		// Wait for it to finish
@@ -537,7 +532,7 @@ func main() {
 		starttime = time.Now()
 		endtime = starttime.Add(time.Second * time.Duration(duration_secs))
 		for n := 1; n <= threads; n++ {
-			go runDownload(n)
+			go runDownload(n, loop)
 		}
 
 		// Wait for it to finish
@@ -559,7 +554,7 @@ func main() {
 		starttime = time.Now()
 		endtime = starttime.Add(time.Second * time.Duration(duration_secs))
 		for n := 1; n <= threads; n++ {
-			go runDelete(n)
+			go runDelete(n, loop)
 		}
 
 		// Wait for it to finish
