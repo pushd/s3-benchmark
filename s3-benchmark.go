@@ -36,7 +36,7 @@ var s3_access_key, s3_secret_key, cw_access_key, cw_secret_key string
 var url_host, bucket, region string
 var duration_secs, threads, loops int
 var object_size uint64
-var running_threads, upload_count, download_count, delete_count, upload_slowdown_count, download_slowdown_count, delete_slowdown_count int32
+var running_threads, upload_count, upload_success_count, download_count, delete_count, upload_slowdown_count, download_slowdown_count, delete_slowdown_count int32
 var endtime, upload_finish, download_finish, delete_finish time.Time
 var enable_cloudwatch bool
 var cloudwatch_namespace string
@@ -279,16 +279,21 @@ func runUpload(thread_num int) {
 		if err != nil {
 			if strings.Contains(err.Error(), "ServiceUnavailable") {
 				atomic.AddInt32(&upload_slowdown_count, 1)
-				atomic.AddInt32(&upload_count, -1)
+				// Don't decrement upload_count - keep object number to avoid gaps
 			} else {
 				log.Fatalf("FATAL: Error uploading object %s: %v", key, err)
 			}
-		} else if enable_cloudwatch && cloudwatch_client != nil {
-			// Publish individual upload metrics
-			throughput := float64(object_size) / opDuration // Convert to MB/s
-			// publishIndividualMetric(cloudwatch_client, "PutLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds)
-			publishIndividualMetric(cloudwatch_client, "PutThroughput", throughput, cwtypes.StandardUnitBytesSecond)
-			publishIndividualMetric(cloudwatch_client, "PutBytes", float64(object_size), cwtypes.StandardUnitBytes)
+		} else {
+			// Track successful uploads
+			atomic.AddInt32(&upload_success_count, 1)
+			
+			if enable_cloudwatch && cloudwatch_client != nil {
+				// Publish individual upload metrics
+				throughput := float64(object_size) / opDuration // Convert to MB/s
+				// publishIndividualMetric(cloudwatch_client, "PutLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds)
+				publishIndividualMetric(cloudwatch_client, "PutThroughputIndividual", throughput, cwtypes.StandardUnitBytesSecond)
+				publishIndividualMetric(cloudwatch_client, "PutBytes", float64(object_size), cwtypes.StandardUnitBytes)
+			}
 		}
 	}
 	// Remember last done time
@@ -299,11 +304,6 @@ func runUpload(thread_num int) {
 
 func runDownload(thread_num int) {
 	for time.Now().Before(endtime) {
-		// Wait for some objects to be uploaded before starting downloads
-		if upload_count == 0 {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
 
 		atomic.AddInt32(&download_count, 1)
 		objnum := rand.Int31n(upload_count) + 1
@@ -338,7 +338,7 @@ func runDownload(thread_num int) {
 				// Publish individual download metrics
 				throughput := float64(object_size) / opDuration// Convert to MB/s
 				// publishIndividualMetric(cloudwatch_client, "GetLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds)
-				publishIndividualMetric(cloudwatch_client, "GetThroughputIndivo", throughput, cwtypes.StandardUnitBytesSecond)
+				publishIndividualMetric(cloudwatch_client, "GetThroughputIndividual", throughput, cwtypes.StandardUnitBytesSecond)
 				publishIndividualMetric(cloudwatch_client, "GetBytes", float64(object_size), cwtypes.StandardUnitBytes)
 			}
 		}
@@ -428,7 +428,7 @@ func main() {
 		log.Fatal("Missing S3 access key. Provide via -a flag or AWS_ACCESS_KEY_ID environment variable.")
 	}
 	if s3_secret_key == "" {
-		log.Fatal("Missing S3 secret key. Provide via -s flag or AWS_SECRET_ACCESS_KEY environment variable.")
+		log.Fatal("Missing S3go secret key. Provide via -s flag or AWS_SECRET_ACCESS_KEY environment variable.")
 	}
 	if enable_cloudwatch && cw_access_key == "" {
 		log.Fatal("Missing CloudWatch access key. Provide via -cwa flag or AWS_CW_ACCESS_KEY_ID environment variable.")
@@ -446,6 +446,9 @@ func main() {
 	if err != nil {
 		hostname = "unknown"
 	}
+	// Remove dashes and special characters from hostname
+	hostname = strings.ReplaceAll(hostname, "-", "")
+	hostname = strings.ReplaceAll(hostname, ".", "")
 
 	// Echo the parameters
 	logit(fmt.Sprintf("Parameters: url=%s, bucket=%s, region=%s, duration=%d, threads=%d, loops=%d, size=%s, cloudwatch=%v, namespace=%s, host=%s",
@@ -470,6 +473,7 @@ func main() {
 
 		// reset counters
 		upload_count = 0
+		upload_success_count = 0
 		upload_slowdown_count = 0
 		download_count = 0
 		download_slowdown_count = 0
@@ -490,9 +494,9 @@ func main() {
 		}
 		upload_time := upload_finish.Sub(starttime).Seconds()
 
-		bps := float64(uint64(upload_count)*object_size) / upload_time
-		logit(fmt.Sprintf("Loop %d: PUT time %.1f secs, objects = %d, speed = %sB/sec, %.1f operations/sec. Slowdowns = %d",
-			loop, upload_time, upload_count, bytefmt.ByteSize(uint64(bps)), float64(upload_count)/upload_time, upload_slowdown_count))
+		bps := float64(uint64(upload_success_count)*object_size) / upload_time
+		logit(fmt.Sprintf("Loop %d: PUT time %.1f secs, objects = %d (attempted: %d), speed = %sB/sec, %.1f operations/sec. Slowdowns = %d",
+			loop, upload_time, upload_success_count, upload_count, bytefmt.ByteSize(uint64(bps)), float64(upload_success_count)/upload_time, upload_slowdown_count))
 
 		// Run the download case
 		running_threads = int32(threads)
@@ -513,8 +517,8 @@ func main() {
 			loop, download_time, download_count, bytefmt.ByteSize(uint64(bps_download)), float64(download_count)/download_time, download_slowdown_count))
 
 		// Publish metrics to CloudWatch
-		bps_upload := float64(uint64(upload_count)*object_size) / upload_time
-		publishCloudWatchMetrics(loop, bps_upload, bps_download, float64(upload_count)/upload_time, float64(download_count)/download_time, upload_count, download_count)
+		bps_upload := float64(uint64(upload_success_count)*object_size) / upload_time
+		publishCloudWatchMetrics(loop, bps_upload, bps_download, float64(upload_success_count)/upload_time, float64(download_count)/download_time, upload_success_count, download_count)
 
 		// Run the delete case
 		running_threads = int32(threads)
