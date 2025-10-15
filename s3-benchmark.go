@@ -278,15 +278,26 @@ func runUpload(thread_num int) {
 		opDuration := time.Since(opStart).Seconds()
 		
 		if err != nil {
-			if strings.Contains(err.Error(), "ServiceUnavailable") {
+			// Check for rate limiting and temporary errors
+			errStr := err.Error()
+			if strings.Contains(errStr, "ServiceUnavailable") || 
+			   strings.Contains(errStr, "SlowDown") ||
+			   strings.Contains(errStr, "RequestTimeout") ||
+			   strings.Contains(errStr, "RequestTimeTooSkewed") {
 				atomic.AddInt32(&upload_slowdown_count, 1)
 				// Don't decrement upload_count - keep object number to avoid gaps
+				log.Printf("Upload failed (rate limit/timeout) for %s: %v", key, err)
 			} else {
 				log.Fatalf("FATAL: Error uploading object %s: %v", key, err)
 			}
 		} else {
 			// Track successful uploads
 			atomic.AddInt32(&upload_success_count, 1)
+			
+			// Log every 10th successful upload for debugging
+			if upload_success_count%10 == 0 {
+				log.Printf("Successfully uploaded %s (success count: %d)", key, upload_success_count)
+			}
 			
 			if enable_cloudwatch && cloudwatch_client != nil {
 				// Publish individual upload metrics
@@ -306,7 +317,9 @@ func runUpload(thread_num int) {
 func runDownload(thread_num int) {
 	for time.Now().Before(endtime) {
 
-		// Ensure upload_count is positive to avoid panic
+		// Wait for successful uploads before downloading
+		// Use upload_count (total attempts) not upload_success_count
+		// This ensures we try to download all attempted object numbers
 		currentCount := atomic.LoadInt32(&upload_count)
 		if currentCount == 0 {
 			time.Sleep(100 * time.Millisecond)
@@ -509,6 +522,15 @@ func main() {
 		bps := float64(uint64(upload_success_count)*object_size) / upload_time
 		logit(fmt.Sprintf("Loop %d: PUT time %.1f secs, objects = %d (attempted: %d), speed = %sB/sec, %.1f operations/sec. Slowdowns = %d",
 			loop, upload_time, upload_success_count, upload_count, bytefmt.ByteSize(uint64(bps)), float64(upload_success_count)/upload_time, upload_slowdown_count))
+		
+		if upload_success_count < upload_count {
+			logit(fmt.Sprintf("WARNING: %d uploads attempted but only %d succeeded! Missing objects: %d",
+				upload_count, upload_success_count, upload_count-upload_success_count))
+		}
+
+		// Wait a bit for S3 eventual consistency
+		log.Printf("Waiting 2 seconds for S3 consistency before downloads...")
+		time.Sleep(2 * time.Second)
 
 		// Run the download case
 		running_threads = int32(threads)
