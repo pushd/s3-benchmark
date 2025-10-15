@@ -260,7 +260,7 @@ func deleteAllObjects() {
 func runUpload(thread_num int, loopnum int) {
 	for time.Now().Before(endtime) {
 		objnum := atomic.AddInt32(&upload_count, 1)
-		key := fmt.Sprintf("Object-%d-%s-%s", objnum, host_id, loopnum)
+		key := fmt.Sprintf("Object-%d-%s-%d", objnum, host_id, loopnum)
 		
 		// Generate unique random data for each object
 		unique_data := make([]byte, object_size)
@@ -323,7 +323,7 @@ func runDownload(thread_num int, loopnum int) {
 		
 		atomic.AddInt32(&download_count, 1)
 		objnum := rand.Int31n(currentCount) + 1
-		key := fmt.Sprintf("Object-%d-%s-%s", objnum, host_id, loopnum)
+		key := fmt.Sprintf("Object-%d-%s-%d", objnum, host_id, loopnum)
 		
 		// Track operation time
 		opStart := time.Now()
@@ -371,7 +371,7 @@ func runDelete(thread_num int, loopnum int) {
 		if objnum > upload_count {
 			break
 		}
-		key := fmt.Sprintf("Object-%d-%s-%s", objnum, host_id, loopnum)
+		key := fmt.Sprintf("Object-%d-%s-%d", objnum, host_id, loopnum)
 		
 		_, err := s3_client.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
 			Bucket: aws.String(bucket),
