@@ -282,11 +282,16 @@ func runUpload(thread_num int, loopnum int) {
 			errStr := err.Error()
 			if strings.Contains(errStr, "ServiceUnavailable") || 
 			   strings.Contains(errStr, "SlowDown") ||
+			   strings.Contains(errStr, "Throttling") ||
 			   strings.Contains(errStr, "RequestTimeout") ||
+			   strings.Contains(errStr, "retry quota exceeded") ||
 			   strings.Contains(errStr, "RequestTimeTooSkewed") {
 				atomic.AddInt32(&upload_slowdown_count, 1)
 				// Don't decrement upload_count - keep object number to avoid gaps
-				log.Printf("Upload failed (rate limit/timeout) for %s: %v", key, err)
+				// Log occasional rate limit errors
+				if upload_slowdown_count%100 == 1 {
+					log.Printf("Upload rate limiting detected (%d slowdowns so far) - continuing benchmark...", upload_slowdown_count)
+				}
 			} else {
 				log.Fatalf("FATAL: Error uploading object %s: %v", key, err)
 			}
@@ -334,10 +339,19 @@ func runDownload(thread_num int, loopnum int) {
 		})
 		
 		if err != nil {
-			if strings.Contains(err.Error(), "ServiceUnavailable") {
+			errStr := err.Error()
+			if strings.Contains(errStr, "ServiceUnavailable") || 
+			   strings.Contains(errStr, "SlowDown") ||
+			   strings.Contains(errStr, "Throttling") ||
+			   strings.Contains(errStr, "RequestTimeout") ||
+			   strings.Contains(errStr, "retry quota exceeded") {
 				atomic.AddInt32(&download_slowdown_count, 1)
 				atomic.AddInt32(&download_count, -1)
-			} else if strings.Contains(err.Error(), "NoSuchKey") {
+				// Log occasional rate limit errors
+				if download_slowdown_count%100 == 1 {
+					log.Printf("Rate limiting detected (%d slowdowns so far) - continuing benchmark...", download_slowdown_count)
+				}
+			} else if strings.Contains(errStr, "NoSuchKey") {
 				atomic.AddInt32(&download_slowdown_count, 1)
 				atomic.AddInt32(&download_count, -1)
 				log.Printf("Object %s not found (upload_count=%d, objnum=%d, host_id='%s'), skipping...", key, upload_count, objnum, host_id)
@@ -565,6 +579,19 @@ func main() {
 
 		logit(fmt.Sprintf("Loop %d: DELETE time %.1f secs, %.1f deletes/sec. Slowdowns = %d",
 			loop, delete_time, float64(upload_count)/delete_time, delete_slowdown_count))
+		
+		// Summary of this loop
+		total_upload_attempts := upload_count
+		total_upload_success := upload_success_count
+		total_upload_failed := upload_slowdown_count
+		total_download_attempts := download_count + download_slowdown_count
+		total_download_success := download_count
+		total_download_failed := download_slowdown_count
+		
+		logit(fmt.Sprintf("Loop %d Summary: Uploads: %d/%d succeeded (%.1f%% rate limited), Downloads: %d/%d succeeded (%.1f%% rate limited)",
+			loop,
+			total_upload_success, total_upload_attempts, float64(total_upload_failed)/float64(total_upload_attempts)*100,
+			total_download_success, total_download_attempts, float64(total_download_failed)/float64(total_download_attempts)*100))
 	}
 
 	// All done
