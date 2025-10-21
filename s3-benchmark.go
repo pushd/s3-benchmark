@@ -163,7 +163,7 @@ func createMetric(name string, value float64, unit cwtypes.StandardUnit, timesta
 	}
 }
 
-func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerSec, getOpsPerSec float64, putCount, getCount int32) {
+func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerSec, getOpsPerSec float64, putCount, getCount, putRateLimited, getRateLimited int32) {
 	if !enable_cloudwatch || cloudwatch_client == nil {
 		return
 	}
@@ -178,6 +178,8 @@ func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerS
 		createMetric("GetOpsPerSecond", getOpsPerSec, cwtypes.StandardUnitCountSecond, timestamp),
 		createMetric("PutObjectCount", float64(putCount), cwtypes.StandardUnitCount, timestamp),
 		createMetric("GetObjectCount", float64(getCount), cwtypes.StandardUnitCount, timestamp),
+		createMetric("PutRateLimited", float64(putRateLimited), cwtypes.StandardUnitCount, timestamp),
+		createMetric("GetRateLimited", float64(getRateLimited), cwtypes.StandardUnitCount, timestamp),
 	}
 	
 	// Publish metrics to CloudWatch
@@ -561,7 +563,7 @@ func main() {
 
 		// Publish metrics to CloudWatch
 		bps_upload := float64(uint64(upload_success_count)*object_size) / upload_time
-		publishCloudWatchMetrics(loop, bps_upload, bps_download, float64(upload_success_count)/upload_time, float64(download_count)/download_time, upload_success_count, download_count)
+		publishCloudWatchMetrics(loop, bps_upload, bps_download, float64(upload_success_count)/upload_time, float64(download_count)/download_time, upload_success_count, download_count, upload_slowdown_count, download_slowdown_count)
 
 		// Run the delete case
 		running_threads = int32(threads)
