@@ -290,7 +290,7 @@ func runUpload(thread_num int, loopnum int) {
 				// Don't decrement upload_count - keep object number to avoid gaps
 				// Log occasional rate limit errors
 				if upload_slowdown_count%100 == 1 {
-					log.Printf("Upload rate limiting detected (%d slowdowns so far) - continuing benchmark...", upload_slowdown_count)
+					log.Printf("[UPLOAD RATE LIMIT] %d upload slowdowns so far - continuing benchmark...", upload_slowdown_count)
 				}
 			} else {
 				log.Fatalf("FATAL: Error uploading object %s: %v", key, err)
@@ -349,7 +349,7 @@ func runDownload(thread_num int, loopnum int) {
 				atomic.AddInt32(&download_count, -1)
 				// Log occasional rate limit errors
 				if download_slowdown_count%100 == 1 {
-					log.Printf("Rate limiting detected (%d slowdowns so far) - continuing benchmark...", download_slowdown_count)
+					log.Printf("[DOWNLOAD RATE LIMIT] %d download slowdowns so far - continuing benchmark...", download_slowdown_count)
 				}
 			} else if strings.Contains(errStr, "NoSuchKey") {
 				atomic.AddInt32(&download_slowdown_count, 1)
@@ -580,18 +580,28 @@ func main() {
 		logit(fmt.Sprintf("Loop %d: DELETE time %.1f secs, %.1f deletes/sec. Slowdowns = %d",
 			loop, delete_time, float64(upload_count)/delete_time, delete_slowdown_count))
 		
-		// Summary of this loop
+		// Summary of this loop with separate rate limit metrics
 		total_upload_attempts := upload_count
 		total_upload_success := upload_success_count
-		total_upload_failed := upload_slowdown_count
+		total_upload_rate_limited := upload_slowdown_count
 		total_download_attempts := download_count + download_slowdown_count
 		total_download_success := download_count
-		total_download_failed := download_slowdown_count
+		total_download_rate_limited := download_slowdown_count
 		
-		logit(fmt.Sprintf("Loop %d Summary: Uploads: %d/%d succeeded (%.1f%% rate limited), Downloads: %d/%d succeeded (%.1f%% rate limited)",
-			loop,
-			total_upload_success, total_upload_attempts, float64(total_upload_failed)/float64(total_upload_attempts)*100,
-			total_download_success, total_download_attempts, float64(total_download_failed)/float64(total_download_attempts)*100))
+		upload_rate_limit_pct := float64(0)
+		if total_upload_attempts > 0 {
+			upload_rate_limit_pct = float64(total_upload_rate_limited) / float64(total_upload_attempts) * 100
+		}
+		download_rate_limit_pct := float64(0)
+		if total_download_attempts > 0 {
+			download_rate_limit_pct = float64(total_download_rate_limited) / float64(total_download_attempts) * 100
+		}
+		
+		logit(fmt.Sprintf("Loop %d Summary:",loop))
+		logit(fmt.Sprintf("  UPLOAD:   %d/%d succeeded, %d rate limited (%.1f%%)",
+			total_upload_success, total_upload_attempts, total_upload_rate_limited, upload_rate_limit_pct))
+		logit(fmt.Sprintf("  DOWNLOAD: %d/%d succeeded, %d rate limited (%.1f%%)",
+			total_download_success, total_download_attempts, total_download_rate_limited, download_rate_limit_pct))
 	}
 
 	// All done
