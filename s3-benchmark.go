@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 
 	"code.cloudfoundry.org/bytefmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
@@ -37,6 +39,7 @@ var url_host, bucket, region string
 var duration_secs, threads, loops int
 var object_size uint64
 var running_threads, upload_count, upload_success_count, download_count, delete_count, upload_slowdown_count, download_slowdown_count, delete_slowdown_count int32
+var upload_4xx_count, upload_5xx_count, download_4xx_count, download_5xx_count int32
 var endtime, upload_finish, download_finish, delete_finish time.Time
 var enable_cloudwatch bool
 var cloudwatch_namespace string
@@ -44,6 +47,9 @@ var hostname string
 var host_id string
 var s3_client *s3.Client
 var cloudwatch_client *cloudwatch.Client
+
+// CloudWatch sampling rate - fixed at 1% to reduce costs while maintaining statistical accuracy
+const cloudwatch_sample_rate = 0.01
 
 func logit(msg string) {
 	fmt.Println(msg)
@@ -125,6 +131,16 @@ func getCloudWatchClient() *cloudwatch.Client {
 }
 
 func publishIndividualMetric(client *cloudwatch.Client, metricName string, value float64, unit cwtypes.StandardUnit) {
+	// Sample based on configured rate (0.0 to 1.0)
+	// If sampling, multiply the value by the inverse of the sample rate to get population estimate
+	if cloudwatch_sample_rate < 1.0 {
+		if rand.Float64() > cloudwatch_sample_rate {
+			return // Skip this metric
+		}
+		// Upsample: multiply by inverse of sample rate to represent full population
+		value = value * (1.0 / cloudwatch_sample_rate)
+	}
+	
 	timestamp := time.Now()
 	
 	metricData := []cwtypes.MetricDatum{
@@ -163,7 +179,7 @@ func createMetric(name string, value float64, unit cwtypes.StandardUnit, timesta
 	}
 }
 
-func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerSec, getOpsPerSec float64, putCount, getCount, putRateLimited, getRateLimited int32) {
+func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerSec, getOpsPerSec float64, putCount, getCount, putRateLimited, getRateLimited, put4xx, put5xx, get4xx, get5xx int32) {
 	if !enable_cloudwatch || cloudwatch_client == nil {
 		return
 	}
@@ -180,6 +196,10 @@ func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerS
 		createMetric("GetObjectCount", float64(getCount), cwtypes.StandardUnitCount, timestamp),
 		createMetric("PutRateLimited", float64(putRateLimited), cwtypes.StandardUnitCount, timestamp),
 		createMetric("GetRateLimited", float64(getRateLimited), cwtypes.StandardUnitCount, timestamp),
+		createMetric("Put4xxErrors", float64(put4xx), cwtypes.StandardUnitCount, timestamp),
+		createMetric("Put5xxErrors", float64(put5xx), cwtypes.StandardUnitCount, timestamp),
+		createMetric("Get4xxErrors", float64(get4xx), cwtypes.StandardUnitCount, timestamp),
+		createMetric("Get5xxErrors", float64(get5xx), cwtypes.StandardUnitCount, timestamp),
 	}
 	
 	// Publish metrics to CloudWatch
@@ -193,6 +213,56 @@ func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerS
 	} else {
 		log.Printf("Successfully published aggregate metrics to CloudWatch namespace: %s", cloudwatch_namespace)
 	}
+}
+
+// classifyHTTPError categorizes errors by HTTP status code from actual response
+func classifyHTTPError(err error) (is4xx, is5xx bool) {
+	if err == nil {
+		return false, false
+	}
+	
+	// Try to extract HTTP response from AWS SDK error
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) {
+		statusCode := respErr.HTTPStatusCode()
+		
+		// Check if it's a 4xx error
+		if statusCode >= 400 && statusCode < 500 {
+			return true, false
+		}
+		
+		// Check if it's a 5xx error
+		if statusCode >= 500 && statusCode < 600 {
+			return false, true
+		}
+	}
+	
+	// Fallback to string matching if we can't extract status code
+	errStr := err.Error()
+	
+	// 4xx errors - client errors
+	if strings.Contains(errStr, "400") || strings.Contains(errStr, "BadRequest") ||
+	   strings.Contains(errStr, "403") || strings.Contains(errStr, "Forbidden") || strings.Contains(errStr, "AccessDenied") ||
+	   strings.Contains(errStr, "404") || strings.Contains(errStr, "NoSuchKey") || strings.Contains(errStr, "NoSuchBucket") ||
+	   strings.Contains(errStr, "405") || strings.Contains(errStr, "MethodNotAllowed") ||
+	   strings.Contains(errStr, "409") || strings.Contains(errStr, "Conflict") ||
+	   strings.Contains(errStr, "411") || strings.Contains(errStr, "MissingContentLength") ||
+	   strings.Contains(errStr, "412") || strings.Contains(errStr, "PreconditionFailed") ||
+	   strings.Contains(errStr, "416") || strings.Contains(errStr, "InvalidRange") ||
+	   strings.Contains(errStr, "429") {
+		return true, false
+	}
+	
+	// 5xx errors - server errors
+	if strings.Contains(errStr, "500") || strings.Contains(errStr, "InternalError") ||
+	   strings.Contains(errStr, "501") || strings.Contains(errStr, "NotImplemented") ||
+	   strings.Contains(errStr, "502") || strings.Contains(errStr, "BadGateway") ||
+	   strings.Contains(errStr, "503") || strings.Contains(errStr, "ServiceUnavailable") || strings.Contains(errStr, "SlowDown") ||
+	   strings.Contains(errStr, "504") || strings.Contains(errStr, "GatewayTimeout") {
+		return false, true
+	}
+	
+	return false, false
 }
 
 func createBucket(ignore_errors bool) {
@@ -280,6 +350,16 @@ func runUpload(thread_num int, loopnum int) {
 		opDuration := time.Since(opStart).Seconds()
 		
 		if err != nil {
+			// Classify error type
+			is4xx, is5xx := classifyHTTPError(err)
+			
+			if is4xx {
+				atomic.AddInt32(&upload_4xx_count, 1)
+			}
+			if is5xx {
+				atomic.AddInt32(&upload_5xx_count, 1)
+			}
+			
 			// Check for rate limiting and temporary errors
 			errStr := err.Error()
 			if strings.Contains(errStr, "ServiceUnavailable") || 
@@ -341,6 +421,16 @@ func runDownload(thread_num int, loopnum int) {
 		})
 		
 		if err != nil {
+			// Classify error type
+			is4xx, is5xx := classifyHTTPError(err)
+			
+			if is4xx {
+				atomic.AddInt32(&download_4xx_count, 1)
+			}
+			if is5xx {
+				atomic.AddInt32(&download_5xx_count, 1)
+			}
+			
 			errStr := err.Error()
 			if strings.Contains(errStr, "ServiceUnavailable") || 
 			   strings.Contains(errStr, "SlowDown") ||
@@ -497,7 +587,8 @@ func main() {
 	// Initialize CloudWatch client if enabled (create once, reuse for all operations)
 	if enable_cloudwatch {
 		cloudwatch_client = getCloudWatchClient()
-		log.Printf("CloudWatch metrics enabled - namespace: %s, host: %s", cloudwatch_namespace, hostname)
+		log.Printf("CloudWatch metrics enabled - namespace: %s, host: %s, sampling: 1%% (upsampled by 100x for cost reduction)", 
+			cloudwatch_namespace, hostname)
 	}
 
 	// Create the bucket and delete all the objects
@@ -511,8 +602,12 @@ func main() {
 		upload_count = 0
 		upload_success_count = 0
 		upload_slowdown_count = 0
+		upload_4xx_count = 0
+		upload_5xx_count = 0
 		download_count = 0
 		download_slowdown_count = 0
+		download_4xx_count = 0
+		download_5xx_count = 0
 		delete_count = 0
 		delete_slowdown_count = 0
 
@@ -563,7 +658,7 @@ func main() {
 
 		// Publish metrics to CloudWatch
 		bps_upload := float64(uint64(upload_success_count)*object_size) / upload_time
-		publishCloudWatchMetrics(loop, bps_upload, bps_download, float64(upload_success_count)/upload_time, float64(download_count)/download_time, upload_success_count, download_count, upload_slowdown_count, download_slowdown_count)
+		publishCloudWatchMetrics(loop, bps_upload, bps_download, float64(upload_success_count)/upload_time, float64(download_count)/download_time, upload_success_count, download_count, upload_slowdown_count, download_slowdown_count, upload_4xx_count, upload_5xx_count, download_4xx_count, download_5xx_count)
 
 		// Run the delete case
 		running_threads = int32(threads)
