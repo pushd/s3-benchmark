@@ -593,7 +593,6 @@ func main() {
 
 	// Create the bucket and delete all the objects
 	createBucket(true)
-	deleteAllObjects()
 
 	// Loop running the tests
 	for loop := 1; loop <= loops; loop++ {
