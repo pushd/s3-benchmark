@@ -368,11 +368,11 @@ func runUpload(thread_num int, loopnum int) {
 			   strings.Contains(errStr, "RequestTimeout") ||
 			   strings.Contains(errStr, "retry quota exceeded") ||
 			   strings.Contains(errStr, "RequestTimeTooSkewed") {
-				atomic.AddInt32(&upload_slowdown_count, 1)
+				count := atomic.AddInt32(&upload_slowdown_count, 1)
 				// Don't decrement upload_count - keep object number to avoid gaps
-				// Log occasional rate limit errors
-				if upload_slowdown_count%100 == 1 {
-					log.Printf("[UPLOAD RATE LIMIT] %d upload slowdowns so far - continuing benchmark...", upload_slowdown_count)
+				// Log every 100th rate limit error with server error details
+				if count%100 == 1 {
+					log.Printf("[UPLOAD RATE LIMIT] %d upload slowdowns so far - last error: %v", count, err)
 				}
 			} else {
 				log.Fatalf("FATAL: Error uploading object %s: %v", key, err)
@@ -437,11 +437,11 @@ func runDownload(thread_num int, loopnum int) {
 			   strings.Contains(errStr, "Throttling") ||
 			   strings.Contains(errStr, "RequestTimeout") ||
 			   strings.Contains(errStr, "retry quota exceeded") {
-				atomic.AddInt32(&download_slowdown_count, 1)
+				count := atomic.AddInt32(&download_slowdown_count, 1)
 				atomic.AddInt32(&download_count, -1)
-				// Log occasional rate limit errors
-				if download_slowdown_count%100 == 1 {
-					log.Printf("[DOWNLOAD RATE LIMIT] %d download slowdowns so far - continuing benchmark...", download_slowdown_count)
+				// Log every 100th rate limit error with server error details
+				if count%100 == 1 {
+					log.Printf("[DOWNLOAD RATE LIMIT] %d download slowdowns so far - last error: %v", count, err)
 				}
 			} else if strings.Contains(errStr, "NoSuchKey") {
 				atomic.AddInt32(&download_slowdown_count, 1)
@@ -485,9 +485,18 @@ func runDelete(thread_num int, loopnum int) {
 		})
 		
 		if err != nil {
-			if strings.Contains(err.Error(), "ServiceUnavailable") {
-				atomic.AddInt32(&delete_slowdown_count, 1)
+			errStr := err.Error()
+			if strings.Contains(errStr, "ServiceUnavailable") || 
+			   strings.Contains(errStr, "SlowDown") ||
+			   strings.Contains(errStr, "Throttling") ||
+			   strings.Contains(errStr, "RequestTimeout") ||
+			   strings.Contains(errStr, "retry quota exceeded") {
+				count := atomic.AddInt32(&delete_slowdown_count, 1)
 				atomic.AddInt32(&delete_count, -1)
+				// Log every 100th rate limit error with server error details
+				if count%100 == 1 {
+					log.Printf("[DELETE RATE LIMIT] %d delete slowdowns so far - last error: %v", count, err)
+				}
 			} else {
 				log.Fatalf("FATAL: Error deleting object %s: %v", key, err)
 			}
