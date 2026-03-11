@@ -133,13 +133,18 @@ func getCloudWatchClient() *cloudwatch.Client {
 
 func publishIndividualMetric(client *cloudwatch.Client, metricName string, value float64, unit cwtypes.StandardUnit) {
 	// Sample based on configured rate (0.0 to 1.0)
-	// If sampling, multiply the value by the inverse of the sample rate to get population estimate
+	// For count/throughput metrics we upsample the value by the inverse of the sample rate.
+	// For latency metrics (e.g. *Latency, *Millis) we DO NOT upsample so that percentile/average math is meaningful.
 	if cloudwatch_sample_rate < 1.0 {
 		if rand.Float64() > cloudwatch_sample_rate {
 			return // Skip this metric
 		}
-		// Upsample: multiply by inverse of sample rate to represent full population
-		value = value * (1.0 / cloudwatch_sample_rate)
+		// Determine if this is a latency metric
+		isLatencyMetric := strings.Contains(metricName, "Latency") || strings.HasSuffix(metricName, "Millis")
+		if !isLatencyMetric {
+			// Upsample: multiply by inverse of sample rate to represent full population
+			value = value * (1.0 / cloudwatch_sample_rate)
+		}
 	}
 	
 	timestamp := time.Now()
