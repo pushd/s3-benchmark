@@ -40,6 +40,7 @@ var duration_secs, threads, loops int
 var object_size uint64
 var running_threads, upload_count, upload_success_count, download_count, delete_count, upload_slowdown_count, download_slowdown_count, delete_slowdown_count int32
 var upload_4xx_count, upload_5xx_count, download_4xx_count, download_5xx_count int32
+var download_ttfb_total_ns, download_total_time_total_ns int64
 var endtime, upload_finish, download_finish, delete_finish time.Time
 var enable_cloudwatch bool
 var cloudwatch_namespace string
@@ -179,7 +180,7 @@ func createMetric(name string, value float64, unit cwtypes.StandardUnit, timesta
 	}
 }
 
-func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerSec, getOpsPerSec float64, putCount, getCount, putRateLimited, getRateLimited, put4xx, put5xx, get4xx, get5xx int32) {
+func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerSec, getOpsPerSec, avgGetTTFBMillis, avgGetTotalTimeMillis float64, putCount, getCount, putRateLimited, getRateLimited, put4xx, put5xx, get4xx, get5xx int32) {
 	if !enable_cloudwatch || cloudwatch_client == nil {
 		return
 	}
@@ -192,6 +193,8 @@ func publishCloudWatchMetrics(loop int, putThroughput, getThroughput, putOpsPerS
 		createMetric("GetThroughput", getThroughput/1024/1024, cwtypes.StandardUnitMegabytesSecond, timestamp),
 		createMetric("PutOpsPerSecond", putOpsPerSec, cwtypes.StandardUnitCountSecond, timestamp),
 		createMetric("GetOpsPerSecond", getOpsPerSec, cwtypes.StandardUnitCountSecond, timestamp),
+		createMetric("GetTTFBAverageMillis", avgGetTTFBMillis, cwtypes.StandardUnitMilliseconds, timestamp),
+		createMetric("GetTotalTimeAverageMillis", avgGetTotalTimeMillis, cwtypes.StandardUnitMilliseconds, timestamp),
 		createMetric("PutObjectCount", float64(putCount), cwtypes.StandardUnitCount, timestamp),
 		createMetric("GetObjectCount", float64(getCount), cwtypes.StandardUnitCount, timestamp),
 		createMetric("PutRateLimited", float64(putRateLimited), cwtypes.StandardUnitCount, timestamp),
@@ -451,15 +454,28 @@ func runDownload(thread_num int, loopnum int) {
 				log.Fatalf("FATAL: Error downloading object %s: %v", key, err)
 			}
 		} else if result.Body != nil {
-			io.Copy(ioutil.Discard, result.Body)
+			// Measure time to first byte (TTFB)
+			_, readErr := io.CopyN(ioutil.Discard, result.Body, 1)
+			if readErr != nil && readErr != io.EOF {
+				log.Fatalf("FATAL: Error reading first byte of object %s: %v", key, readErr)
+			}
+			ttfb := time.Since(opStart)
+
+			// Read the rest of the object
+			_, _ = io.Copy(ioutil.Discard, result.Body)
 			result.Body.Close()
 			
-			opDuration := time.Since(opStart).Seconds()
+			totalDuration := time.Since(opStart)
+
+			// Accumulate aggregate latency stats (nanoseconds) for downloads
+			atomic.AddInt64(&download_ttfb_total_ns, ttfb.Nanoseconds())
+			atomic.AddInt64(&download_total_time_total_ns, totalDuration.Nanoseconds())
 			
 			if enable_cloudwatch && cloudwatch_client != nil {
 				// Publish individual download metrics
-				throughput := float64(object_size) / opDuration// Convert to MB/s
-				// publishIndividualMetric(cloudwatch_client, "GetLatency", opDuration*1000, cwtypes.StandardUnitMilliseconds)
+				throughput := float64(object_size) / totalDuration.Seconds()
+				publishIndividualMetric(cloudwatch_client, "GetTTFBMillis", float64(ttfb.Milliseconds()), cwtypes.StandardUnitMilliseconds)
+				publishIndividualMetric(cloudwatch_client, "GetTotalTimeMillis", float64(totalDuration.Milliseconds()), cwtypes.StandardUnitMilliseconds)
 				publishIndividualMetric(cloudwatch_client, "GetThroughputIndividual", throughput, cwtypes.StandardUnitBytesSecond)
 				publishIndividualMetric(cloudwatch_client, "GetBytes", float64(object_size), cwtypes.StandardUnitBytes)
 			}
@@ -618,6 +634,8 @@ func main() {
 		download_5xx_count = 0
 		delete_count = 0
 		delete_slowdown_count = 0
+		download_ttfb_total_ns = 0
+		download_total_time_total_ns = 0
 
 		// Run the upload case
 		running_threads = int32(threads)
@@ -664,9 +682,16 @@ func main() {
 		logit(fmt.Sprintf("Loop %d: GET time %.1f secs, objects = %d, speed = %sB/sec, %.1f operations/sec. Slowdowns = %d",
 			loop, download_time, download_count, bytefmt.ByteSize(uint64(bps_download)), float64(download_count)/download_time, download_slowdown_count))
 
+		// Compute aggregate latency metrics for downloads (averages in milliseconds)
+		var avgGetTTFBMillis, avgGetTotalTimeMillis float64
+		if download_count > 0 {
+			avgGetTTFBMillis = float64(download_ttfb_total_ns) / float64(download_count) / 1e6
+			avgGetTotalTimeMillis = float64(download_total_time_total_ns) / float64(download_count) / 1e6
+		}
+
 		// Publish metrics to CloudWatch
 		bps_upload := float64(uint64(upload_success_count)*object_size) / upload_time
-		publishCloudWatchMetrics(loop, bps_upload, bps_download, float64(upload_success_count)/upload_time, float64(download_count)/download_time, upload_success_count, download_count, upload_slowdown_count, download_slowdown_count, upload_4xx_count, upload_5xx_count, download_4xx_count, download_5xx_count)
+		publishCloudWatchMetrics(loop, bps_upload, bps_download, float64(upload_success_count)/upload_time, float64(download_count)/download_time, avgGetTTFBMillis, avgGetTotalTimeMillis, upload_success_count, download_count, upload_slowdown_count, download_slowdown_count, upload_4xx_count, upload_5xx_count, download_4xx_count, download_5xx_count)
 
 		// Run the delete case
 		running_threads = int32(threads)
